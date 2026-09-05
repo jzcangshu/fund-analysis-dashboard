@@ -16,6 +16,7 @@ class DrawdownPoint:
     value: Decimal | None
     peak_value: Decimal | None
     drawdown: Decimal | None
+    max_drawdown: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +46,7 @@ def calculate_drawdown(records: list[Any] | tuple[Any, ...]) -> DrawdownResult:
     for valuation_day, record in dated:
         value = decimal(field(record, "adjusted_nav", "cumulative_unit_nav", "value"))
         if value is None:
-            points.append(DrawdownPoint(valuation_day, None, running_peak, None))
+            points.append(DrawdownPoint(valuation_day, None, running_peak, None, worst))
             continue
 
         if running_peak is None or value > running_peak:
@@ -53,13 +54,15 @@ def calculate_drawdown(records: list[Any] | tuple[Any, ...]) -> DrawdownResult:
             running_peak_date = valuation_day
 
         drawdown = None if running_peak == 0 else value / running_peak - Decimal(1)
-        points.append(DrawdownPoint(valuation_day, value, running_peak, drawdown))
         if drawdown is not None and (worst is None or drawdown < worst):
             worst = drawdown
             worst_peak_date = running_peak_date
             worst_trough_date = valuation_day
             worst_peak_value = running_peak
             worst_trough_value = value
+        points.append(
+            DrawdownPoint(valuation_day, value, running_peak, drawdown, worst)
+        )
 
     current_drawdown = points[-1].drawdown if points else None
     if worst is None and running_peak not in (None, Decimal(0)):

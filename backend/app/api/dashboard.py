@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Annotated
 
@@ -12,6 +12,7 @@ from sqlalchemy import func, over, select
 from sqlalchemy.orm import Session, aliased
 
 from app.analytics.nav import calculate_nav_series
+from app.analytics.scope import COMPANY_SCOPE_TRIGGER
 from app.auth.dependencies import AuthContext, get_auth_context, get_db
 from app.db.base import (
     AnalysisRunStatus,
@@ -185,12 +186,14 @@ def _metric_for_version(
 
 
 def _latest_company_metric(
-    session: Session, as_of: date | None
+    session: Session, as_of: date | None, *, minimum_run_id: int | None = None
 ) -> tuple[CompanyMetricDaily | None, AnalysisRun | None]:
     published_date_exists = (
         select(ValuationVersion.id)
+        .join(Fund, Fund.id == ValuationVersion.fund_id)
         .where(
             ValuationVersion.status == ValuationStatus.PUBLISHED,
+            Fund.status == FundStatus.ACTIVE,
             ValuationVersion.valuation_date == CompanyMetricDaily.valuation_date,
         )
         .exists()
@@ -210,6 +213,8 @@ def _latest_company_metric(
     )
     if as_of is not None:
         statement = statement.where(CompanyMetricDaily.valuation_date == as_of)
+    if minimum_run_id is not None:
+        statement = statement.where(AnalysisRun.id >= minimum_run_id)
     row = session.execute(statement.limit(1)).first()
     if row is None:
         return None, None
@@ -362,6 +367,20 @@ def overview(
         or 0
     )
     analysis_states = [views[version.id].analysis_status for version in versions]
+    scope_run = session.scalar(
+        select(AnalysisRun)
+        .where(AnalysisRun.trigger_reason == COMPANY_SCOPE_TRIGGER)
+        .order_by(AnalysisRun.id.desc())
+        .limit(1)
+    )
+    if scope_run is not None:
+        analysis_states.append(
+            "ready"
+            if scope_run.status == AnalysisRunStatus.SUCCEEDED
+            else "stale"
+            if scope_run.status == AnalysisRunStatus.FAILED
+            else "pending"
+        )
     analysis_status = (
         "stale"
         if "stale" in analysis_states
@@ -370,7 +389,9 @@ def overview(
         else "ready"
     )
     company_metric, company_run = (
-        _latest_company_metric(session, as_of)
+        _latest_company_metric(
+            session, as_of, minimum_run_id=scope_run.id if scope_run else None
+        )
         if analysis_status == "ready"
         else (None, None)
     )
@@ -577,15 +598,19 @@ def nav_series(
 ) -> dict[str, object]:
     if session.get(Fund, fund_id) is None:
         raise HTTPException(status_code=404, detail="Fund not found")
-    # Guard against unbounded explicit windows that could OOM the worker;
-    # the default window is already capped to 365 days below.
-    if start is not None and end is not None and (end - start).days > 365 * 5:
+    # Resolve one-sided windows before validating so every query is bounded.
+    effective_end = end or datetime.now(UTC).date()
+    lookback = 365 * 5 if end is not None else 365
+    effective_start = start or date.fromordinal(
+        max(date.min.toordinal(), effective_end.toordinal() - lookback)
+    )
+    if effective_end < effective_start:
+        raise HTTPException(status_code=422, detail="开始日期不能晚于结束日期")
+    if (effective_end - effective_start).days > 365 * 5:
         raise HTTPException(
             status_code=422,
             detail="窗口跨度不能超过 5 年，请缩小范围或使用导出功能",
         )
-    # Cap default lookback so a long-running fund does not OOM the API
-    # worker; clients can still pass start/end explicitly.
     statement = (
         select(ValuationVersion, FundDailySnapshot)
         .join(
@@ -595,18 +620,11 @@ def nav_series(
         .where(
             ValuationVersion.fund_id == fund_id,
             ValuationVersion.status == ValuationStatus.PUBLISHED,
+            ValuationVersion.valuation_date >= effective_start,
+            ValuationVersion.valuation_date <= effective_end,
         )
         .order_by(ValuationVersion.valuation_date)
     )
-    if start is not None:
-        statement = statement.where(ValuationVersion.valuation_date >= start)
-    elif end is None:
-        statement = statement.where(
-            ValuationVersion.valuation_date
-            >= datetime.now(UTC).date() - timedelta(days=365)
-        )
-    if end is not None:
-        statement = statement.where(ValuationVersion.valuation_date <= end)
     rows = list(session.execute(statement))
     versions = [version for version, _ in rows]
     views = _version_views(session, versions)

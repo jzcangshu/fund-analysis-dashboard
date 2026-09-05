@@ -378,13 +378,10 @@ def test_nav_series_caps_default_window_to_one_year(
     assert len(points) == 1
 
 
-def test_nav_series_only_end_does_not_apply_default_cap(
+def test_nav_series_only_end_preserves_bounded_history(
     admin_client, app_and_engine
 ) -> None:
-    """Passing only ``end`` (no ``start``) must skip the 365-day default
-    cap and return points older than one year, since the user explicitly
-    asked for history up to ``end``.
-    """
+    """An explicit end can include older history within the five-year cap."""
     engine = app_and_engine[1]
     fund_id_old, _ = seed_published_fund(
         engine,
@@ -392,8 +389,7 @@ def test_nav_series_only_end_does_not_apply_default_cap(
         valuation_date=date.today() - timedelta(days=900),
         unit_nav=Decimal("1.10"),
     )
-    # Only end is passed → the elif (end is None) is skipped, so the
-    # 900-day-old point is returned without a lower-bound cap.
+    # The 900-day-old point is still inside the bounded history window.
     response = admin_client.get(
         f"/api/v1/funds/{fund_id_old}/nav-series",
         params={"end": date.today().isoformat()},
@@ -427,3 +423,46 @@ def test_nav_series_rejects_window_exceeding_five_years(
         },
     )
     assert response.status_code == 422
+
+
+def test_nav_series_end_only_excludes_history_beyond_five_years(
+    admin_client, app_and_engine
+) -> None:
+    fund_id, _ = seed_published_fund(
+        app_and_engine[1],
+        name="超出单边窗口的历史",
+        valuation_date=date.today() - timedelta(days=365 * 6),
+    )
+    response = admin_client.get(
+        f"/api/v1/funds/{fund_id}/nav-series", params={"end": date.today().isoformat()}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["points"] == []
+
+
+def test_nav_series_start_only_cannot_bypass_span_limit(
+    admin_client, app_and_engine
+) -> None:
+    fund_id, _ = seed_published_fund(app_and_engine[1])
+    response = admin_client.get(
+        f"/api/v1/funds/{fund_id}/nav-series",
+        params={"start": (date.today() - timedelta(days=365 * 6)).isoformat()},
+    )
+
+    assert response.status_code == 422
+
+
+def test_nav_series_rejects_inverted_range_and_handles_earliest_end(
+    admin_client, app_and_engine
+) -> None:
+    fund_id, _ = seed_published_fund(app_and_engine[1])
+    url = f"/api/v1/funds/{fund_id}/nav-series"
+    inverted = admin_client.get(
+        url, params={"start": "2026-09-01", "end": "2026-08-01"}
+    )
+    earliest = admin_client.get(url, params={"end": "0001-01-01"})
+
+    assert inverted.status_code == 422
+    assert earliest.status_code == 200
+    assert earliest.json()["data"]["points"] == []

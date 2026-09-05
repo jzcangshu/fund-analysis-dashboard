@@ -1,6 +1,8 @@
 from datetime import date
 from decimal import Decimal
 
+import pytest
+
 from app.analytics.company import calculate_company_index
 
 
@@ -105,3 +107,41 @@ def test_company_index_rejects_duplicate_fund_date() -> None:
                 },
             ]
         )
+
+
+@pytest.mark.parametrize("previous_assets", [(0, 0), (100, -100), (None, None)])
+def test_company_zero_denominator_is_unknown_without_breaking_later_dates(
+    previous_assets,
+) -> None:
+    records = []
+    for fund_id, previous in enumerate(previous_assets):
+        records.extend(
+            [
+                {
+                    "date": date(2026, 1, 1),
+                    "fund_id": fund_id,
+                    "net_asset_value": previous,
+                },
+                {
+                    "date": date(2026, 1, 2),
+                    "fund_id": fund_id,
+                    "net_asset_value": 100,
+                    "daily_return": Decimal("0.1"),
+                },
+                {
+                    "date": date(2026, 1, 3),
+                    "fund_id": fund_id,
+                    "net_asset_value": 110,
+                    "daily_return": Decimal("0.1"),
+                },
+            ]
+        )
+
+    metrics = calculate_company_index(records)
+
+    assert metrics[1].company_daily_return is None
+    assert metrics[1].company_index is None
+    assert metrics[1].effective_fund_count == 0
+    assert metrics[1].coverage == Decimal(0)
+    assert metrics[2].company_daily_return == Decimal("0.1")
+    assert metrics[2].company_index is None

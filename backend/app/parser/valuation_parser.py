@@ -139,7 +139,12 @@ class ValuationParser:
     def _find_header(worksheet: WorksheetData) -> tuple[int, dict[str, int]]:
         for row_index, row in enumerate(worksheet.rows):
             normalized = {
-                normalize_label(value): index for index, value in enumerate(row)
+                re.sub(
+                    r"(?:\((?:%|元|股|份)\)|%)$",
+                    "",
+                    normalize_label(value).replace("（", "(").replace("）", ")"),
+                ): index
+                for index, value in enumerate(row)
             }
             code_column = next(
                 (index for label, index in normalized.items() if "科目代码" in label),
@@ -152,20 +157,20 @@ class ValuationParser:
             if code_column is None or name_column is None:
                 continue
             required = {
-                "quantity": "数量",
-                "unit_cost": "单位成本",
-                "cost": "成本",
-                "cost_weight": "成本占净值",
-                "market_price": "市价",
-                "market_value": "市值",
-                "market_weight": "市值占净值",
-                "valuation_gain": "估值增值",
-                "suspension_info": "停牌信息",
+                "quantity": ("数量", "持仓数量"),
+                "unit_cost": ("单位成本",),
+                "cost": ("成本", "成本金额", "总成本"),
+                "cost_weight": ("成本占净值",),
+                "market_price": ("市价",),
+                "market_value": ("市值", "市值金额"),
+                "market_weight": ("市值占净值",),
+                "valuation_gain": ("估值增值",),
+                "suspension_info": ("停牌信息",),
             }
             columns = {"code": code_column, "name": name_column}
-            for key, marker in required.items():
+            for key, labels in required.items():
                 columns[key] = next(
-                    (index for label, index in normalized.items() if marker in label),
+                    (normalized[label] for label in labels if label in normalized),
                     -1,
                 )
             return row_index, columns
@@ -302,9 +307,11 @@ class ValuationParser:
                     code=code,
                     name=name,
                     quantity=decimal(cls._cell(row, columns, "quantity")),
+                    unit_cost=decimal(cls._cell(row, columns, "unit_cost")),
                     cost=decimal(cls._cell(row, columns, "cost")),
                     cost_weight=ratio(cls._cell(row, columns, "cost_weight")),
                     market_value=decimal(cls._cell(row, columns, "market_value")),
+                    market_price=decimal(cls._cell(row, columns, "market_price")),
                     market_value_weight=ratio(cls._cell(row, columns, "market_weight")),
                     valuation_gain=decimal(cls._cell(row, columns, "valuation_gain")),
                     suspension_info=text(cls._cell(row, columns, "suspension_info"))
@@ -336,21 +343,16 @@ class ValuationParser:
         # codes) caused distinct securities to collide on the same PositionDaily key.
         security_code = subject.code
         market, account = cls._position_metadata(subject, subjects_by_code)
+        unit_cost = subject.unit_cost
+        if unit_cost is None and subject.cost is not None and subject.quantity:
+            unit_cost = subject.cost / subject.quantity
         return ParsedPosition(
             security_code=security_code,
             security_name=subject.name,
             quantity=subject.quantity,
-            unit_cost=(
-                subject.cost / subject.quantity
-                if subject.cost is not None and subject.quantity
-                else None
-            ),
+            unit_cost=unit_cost,
             cost=subject.cost,
-            market_price=(
-                subject.market_value / subject.quantity
-                if subject.market_value is not None and subject.quantity
-                else None
-            ),
+            market_price=subject.market_price,
             market_value=subject.market_value,
             nav_weight=subject.market_value_weight,
             valuation_gain=subject.valuation_gain,

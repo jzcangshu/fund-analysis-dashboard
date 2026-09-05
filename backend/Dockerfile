@@ -22,7 +22,17 @@ ENV APP_ENV=production \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends postgresql-client \
+    && apt-get install --yes --no-install-recommends ca-certificates curl \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl --fail --silent --show-error --location \
+       https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+       --output /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    && printf '%s\n' 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main' \
+       > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install --yes --no-install-recommends postgresql-client-16 \
+    && pg_dump --version \
+    && pg_restore --version \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 fundapp \
     && useradd --system --uid 10001 --gid fundapp --home-dir /nonexistent \

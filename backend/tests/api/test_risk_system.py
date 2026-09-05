@@ -199,7 +199,7 @@ def test_system_settings_are_whitelisted_persisted_and_admin_only(
     initial = admin_client.get("/api/v1/system/settings")
     assert initial.status_code == 200
     assert initial.json()["data"]["timezone"]["value"] == "Asia/Shanghai"
-    assert "not hot-applied" in initial.json()["meta"]["runtime_note"]
+    assert "retention settings are read" in initial.json()["meta"]["runtime_note"]
 
     updated = admin_client.patch(
         "/api/v1/system/settings",

@@ -194,7 +194,6 @@ def process_import_batch(
         analysis_run = publisher.queue_analysis_run(
             latest.id,
             start_date=min(dates),
-            end_date=max(dates),
             actor_user_id=batch.created_by_user_id,
             trigger_reason="import_batch_auto_published",
         )

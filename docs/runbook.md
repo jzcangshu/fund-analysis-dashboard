@@ -88,20 +88,20 @@ docker compose --env-file deploy/.env -f deploy/compose.prod.yml run --rm --no-d
 
 `source-retention` 默认是预演；只有指定 `--apply` 才删除通过所有安全检查的原始对象。邮件同步已内置定时调度器（API 进程启动时自动运行），支持"每 N 分钟"和"指定时间点 + 星期几"两种模式，可在邮件接入页面配置。数据库备份和源文件清理仍建议使用 root（系统管理员）保护的 `cron`（定时任务）或 `systemd timer`（系统定时器），配置超时、单实例锁和失败告警。推荐数据库备份每天 02:30、源文件预演每天 03:30；邮件暂停开关会让调度器和手动同步安全跳过。
 
-后端每次创建数据库备份后会自动根据 `backup_retention_days`（备份保留天数）清理过期的 `database-*.dump` 文件。清理结果记录在备份审计摘要中。该设置在系统设置页面可调整，默认 30 天。
+数据库备份保留期在每次维护开始时读取系统设置中的 `backup_retention_days`（备份保留天数），默认 30 天。新备份创建失败或归档验证失败时跳过轮转，保留旧恢复点；已产生的失败文件也保留供排查。验证和清理结果记录在备份审计摘要中。
 
 ## 6. 备份和清理
 
-PostgreSQL 使用 `pg_dump`（数据库逻辑备份命令）custom format（自定义格式），备份写入 `database_backups` 数据卷：
+后端镜像通过官方签名软件源明确安装 `postgresql-client-16`（PostgreSQL 16 客户端包），其中包含 `pg_dump`（数据库逻辑备份命令）和 `pg_restore`（数据库归档恢复工具），与 PostgreSQL 16（生产数据库）主版本匹配。备份使用 custom format（自定义格式），写入 `database_backups`（数据库备份）数据卷。创建备份时应用会自动完整读取归档；下面的第二条命令可独立复查最近产物：
 
 ```bash
 docker compose --env-file deploy/.env -f deploy/compose.prod.yml run --rm --no-deps api python -m app.maintenance_cli database-backup
-docker compose --env-file deploy/.env -f deploy/compose.prod.yml run --rm --no-deps -T api sh -c 'latest=$(ls -1t /var/lib/fund-dashboard/backups/database-*.dump | head -n 1) && pg_restore --list "$latest" >/dev/null'
+docker compose --env-file deploy/.env -f deploy/compose.prod.yml run --rm --no-deps -T api sh -c 'latest=$(ls -1t /var/lib/fund-dashboard/backups/database-*.dump | head -n 1) && test -s "$latest" && pg_restore --file /dev/null "$latest"'
 ```
 
-备份轮转现在由后端自动执行：每次 `database-backup` 成功后，系统会删除备份卷内名称匹配 `database-*.dump` 且超过 `backup_retention_days` 保留期的文件。删除结果记录在审计摘要中。禁止把删除范围扩大到整个数据卷。
+备份轮转由后端自动执行：只有新归档非空且完整读取验证通过后，系统才会清理备份卷内名称匹配 `database-*.dump`（数据库备份归档）且超过保留期的普通文件，跳过符号链接并保护本次已验证归档。审计摘要记录实际保留天数、验证结果、跳过原因和删除结果。完整读取能够发现损坏的数据段，但不能替代向隔离数据库实际恢复的验证；恢复点应结合成功审计选择，不能只依赖文件名或修改时间。禁止把删除范围扩大到整个数据卷。
 
-原始 Excel 默认保留 365 天，可由 `SOURCE_RETENTION_DAYS` 或系统设置调整。清理服务不会删除数据库标准化数据、估值版本、分析结果、任务和审计，并会检查待复核引用、活动/失败任务、审计锁、源文件备份审计和对象路径安全。当前没有异地源文件备份适配器，没有成功备份审计时会以 `backup_incomplete`（备份未完成）跳过，不能手工绕过。
+原始 Excel（电子表格）默认保留 365 天。有效的数据库系统设置优先于 `SOURCE_RETENTION_DAYS`（原始文件保留天数环境变量）；没有有效覆盖时使用运行环境值或默认值。每次清理预演和执行均读取有效配置，结果及审计返回 `retention_days`（实际保留天数）和 `retention_source`（配置来源）。来源为 `database`（数据库）、`environment`（环境变量）或 `default`（默认值）；两次操作之间若改过设置，应重新预演。清理服务不会删除数据库标准化数据、估值版本、分析结果、任务和审计，并会检查待复核引用、活动/失败任务、审计锁、源文件备份审计和对象路径安全。当前没有异地源文件备份适配器，没有成功备份审计时会以 `backup_incomplete`（备份未完成）跳过，不能手工绕过。
 
 网页清理必须先调用管理员接口 `POST /api/v1/system/retention/preview`（清理预演），核对候选数量、大小和跳过原因，再调用 `POST /api/v1/system/retention/execute`（清理执行），请求必须包含 `DELETE_EXPIRED_SOURCE_FILES`（删除过期原始文件）和操作原因。
 
@@ -139,7 +139,7 @@ docker compose --env-file deploy/.env -f deploy/compose.prod.yml ps
 
 无数据库结构变更时可以回到已验证的旧镜像；已执行新迁移后不要直接运行旧代码，优先使用向前兼容或从备份恢复。不要把 `alembic downgrade`（迁移回退）当作常规生产回滚。
 
-数据库恢复前记录事故时间、操作者、审批和目标备份，停止 API/worker 写入，先用 `pg_restore --list` 检查归档，再执行恢复。数据库备份不包含原始文件卷和 Caddy 证书数据；恢复后检查迁移版本、健康接口、登录、看板和抽样数据。
+数据库恢复前记录事故时间、操作者、审批和目标备份，停止 API/worker 写入，先用 `pg_restore --list`（列出归档目录）确认对象范围，再用 `pg_restore --file /dev/null <archive>`（完整读取指定归档）检查数据段，并先在隔离数据库演练恢复。数据库备份不包含原始文件卷和 Caddy 证书数据；恢复后检查迁移版本、健康接口、登录、看板和抽样数据。
 
 ## 9. 安全清单
 

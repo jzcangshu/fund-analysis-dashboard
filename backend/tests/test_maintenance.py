@@ -9,6 +9,7 @@ from app.config import get_settings
 from app.db.base import AuditResult, Base, JobStatus
 from app.db.models import AuditLog, BackgroundJob, SystemState
 from app.db.session import create_engine
+from app.mail import MailConfigurationError, MailConnectionError
 from app.maintenance_cli import build_parser
 from app.system.maintenance import (
     MaintenanceResult,
@@ -178,6 +179,33 @@ def test_maintenance_success_is_audited_with_public_summary() -> None:
         assert audit.action == "system.maintenance"
         assert audit.result == AuditResult.SUCCESS
         assert audit.reason == "管理员手工检查"
+    finally:
+        session.close()
+        engine.dispose()
+
+
+@pytest.mark.parametrize("error_type", [MailConfigurationError, MailConnectionError])
+def test_mail_failures_return_controlled_result_and_commit_safe_audit(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
+) -> None:
+    engine, session = _session()
+    try:
+        service = MaintenanceService(session, get_settings())
+
+        def fail_mail():
+            raise error_type("test-secret-must-not-leak")
+
+        monkeypatch.setattr(service, "_run_mail_sync", fail_mail)
+        result = service.run("mail-sync")
+
+        assert result.status == "failed"
+        assert result.error_code == "mail_not_available"
+        with Session(engine) as verification:
+            audit = verification.query(AuditLog).one()
+            assert audit.result == AuditResult.FAILURE
+            assert audit.summary["error_code"] == "mail_not_available"
+            assert audit.summary["error_class"] == error_type.__name__
+            assert "test-secret-must-not-leak" not in repr(audit.summary)
     finally:
         session.close()
         engine.dispose()

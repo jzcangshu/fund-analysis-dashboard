@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ssl
+
 import pytest
 
-from app.mail.client import ImapClient, MailMessageError
+from app.mail.client import ImapClient, MailConnectionError, MailMessageError
 from app.mail.config import MailSettings
 
 from .conftest import FakeConnection, make_email
@@ -97,3 +99,48 @@ def test_fetch_headers_bulk_raises_on_chunk_failure() -> None:
     fake.uid = selective_uid  # type: ignore[method-assign]
     with pytest.raises(MailMessageError):
         client.fetch_headers_bulk(connection, ["1", "2"])
+
+
+def test_default_tls_connection_validates_server_identity_before_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeConnection({})
+    contexts: list[ssl.SSLContext | None] = []
+
+    def connect(host, port, *, timeout, ssl_context=None):
+        contexts.append(ssl_context)
+        return fake
+
+    monkeypatch.setattr("app.mail.client.imaplib.IMAP4_SSL", connect)
+    with ImapClient(_make_settings()).open():
+        pass
+
+    assert len(contexts) == 1
+    context = contexts[0]
+    assert context is not None
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+    assert fake.logged_in_with is not None
+    assert fake.logged_out
+
+
+def test_certificate_failure_does_not_send_credentials_or_retry_without_tls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeConnection({})
+    attempts = []
+
+    def reject_certificate(*args, **kwargs):
+        attempts.append(kwargs)
+        raise ssl.SSLCertVerificationError("certificate verify failed")
+
+    def plaintext(*args, **kwargs):
+        pytest.fail("TLS failure must not fall back to a plaintext connection")
+
+    monkeypatch.setattr("app.mail.client.imaplib.IMAP4_SSL", reject_certificate)
+    monkeypatch.setattr("app.mail.client.imaplib.IMAP4", plaintext)
+    with pytest.raises(MailConnectionError, match="imap_connection_failed"):
+        ImapClient(_make_settings()).open()
+
+    assert len(attempts) == 1
+    assert fake.logged_in_with is None

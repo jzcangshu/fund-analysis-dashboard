@@ -121,24 +121,20 @@ class MaintenanceService:
     ) -> MaintenanceResult:
         if command not in MAINTENANCE_COMMANDS:
             raise ValueError(f"unsupported maintenance command: {command}")
+        error_class = ""
         try:
             status, summary, error_code = self._dispatch(
                 command, dry_run=dry_run, output_name=output_name
             )
-        except (MailConfigurationError, MailConnectionError):
+        except (MailConfigurationError, MailConnectionError) as exc:
             self.session.rollback()
             status, summary, error_code = "failed", {}, "mail_not_available"
+            error_class = type(exc).__name__
         except Exception as exc:  # noqa: BLE001 - maintenance failures are audited safely
             self.session.rollback()
             status, summary, error_code = "failed", {}, "maintenance_failed"
-            # Record the exception class so operators can grep server logs by
-            # it without the audit row absorbing potentially-secret str(exc)
-            # content. The full traceback stays in the server log.
+            # Exception messages and tracebacks can contain credentials.
             error_class = type(exc).__name__
-            error_traceback = ""
-        else:
-            error_class = ""
-            error_traceback = ""
 
         result = MaintenanceResult(command, status, summary, error_code)
         audit_summary: dict[str, object] = {"command": command, "status": status}
@@ -146,8 +142,6 @@ class MaintenanceService:
             audit_summary["error_code"] = error_code or "maintenance_failed"
             if error_class:
                 audit_summary["error_class"] = error_class
-            if error_traceback:
-                audit_summary["error_traceback"] = error_traceback
         else:
             audit_summary.update(summary)
         self.session.add(
@@ -225,6 +219,8 @@ class MaintenanceService:
         ).run(dry_run=dry_run)
         summary = {
             "dry_run": result.dry_run,
+            "retention_days": result.retention_days,
+            "retention_source": result.retention_source,
             "candidate_count": result.candidate_count,
             "deleted_count": result.deleted_count,
             "total_size": result.total_size,

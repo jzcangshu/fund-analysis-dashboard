@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import imaplib
 import re
+import ssl
 from collections.abc import Callable
 from typing import Any
 
@@ -21,7 +22,10 @@ class MailMessageError(RuntimeError):
 def _default_connection(settings: MailSettings) -> Any:
     if settings.use_ssl:
         return imaplib.IMAP4_SSL(
-            settings.host, settings.port, timeout=settings.timeout_seconds
+            settings.host,
+            settings.port,
+            timeout=settings.timeout_seconds,
+            ssl_context=ssl.create_default_context(),
         )
     return imaplib.IMAP4(settings.host, settings.port, timeout=settings.timeout_seconds)
 

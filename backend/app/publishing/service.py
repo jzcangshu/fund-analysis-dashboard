@@ -665,9 +665,10 @@ class PublishingService:
         start_date: date | None = None,
         end_date: date | None = None,
     ) -> AnalysisRun:
+        end_label = end_date.isoformat() if end_date is not None else "latest"
         input_version_range = (
-            f"fund:{version.fund_id};dates:{start_date.isoformat()}..{end_date.isoformat()}"
-            if start_date is not None and end_date is not None
+            f"fund:{version.fund_id};dates:{start_date.isoformat()}..{end_label}"
+            if start_date is not None
             else f"valuation_version:{version.id}"
         )
         analysis_run = AnalysisRun(
@@ -695,13 +696,13 @@ class PublishingService:
         version_id: int,
         *,
         start_date: date,
-        end_date: date,
+        end_date: date | None = None,
         actor_user_id: int | None,
         trigger_reason: str,
     ) -> AnalysisRun:
-        """Queue one bounded analysis run after a batch publication."""
+        """Queue analysis through the latest data unless an end is requested."""
 
-        if start_date > end_date:
+        if end_date is not None and start_date > end_date:
             raise PublishingStateError("analysis_date_range_invalid")
         try:
             with self.session.begin_nested():
@@ -723,7 +724,7 @@ class PublishingService:
                             "trigger_version_id": version.id,
                             "fund_id": version.fund_id,
                             "start_date": start_date.isoformat(),
-                            "end_date": end_date.isoformat(),
+                            "end_date": end_date.isoformat() if end_date else None,
                         },
                         result=AuditResult.SUCCESS,
                     )
