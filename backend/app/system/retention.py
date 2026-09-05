@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -20,6 +20,7 @@ from app.db.models import (
     ValuationVersion,
 )
 from app.imports.storage import UnsafeStoragePathError, resolve_in_root
+from app.system.settings import effective_settings
 
 ACTIVE_TASK_STATUSES = frozenset(
     {
@@ -85,6 +86,7 @@ class CleanupResult:
     skipped_reasons: dict[str, int] = field(default_factory=dict)
     errors: tuple[str, ...] = ()
     audit_log_id: int | None = None
+    retention_source: str = "explicit"
 
     @property
     def skipped(self) -> dict[str, int]:
@@ -213,6 +215,7 @@ class RetentionService:
         *,
         storage_root: Path,
         retention_days: int = DEFAULT_SOURCE_RETENTION_DAYS,
+        retention_source: str = "explicit",
         backup_checker: SourceBackupChecker | None = None,
         actor_user_id: int | None = None,
     ) -> None:
@@ -221,6 +224,7 @@ class RetentionService:
         self.session = session
         self.storage_root = Path(storage_root).resolve()
         self.retention_days = retention_days
+        self.retention_source = retention_source
         self.backup_checker = backup_checker
         self.actor_user_id = actor_user_id
 
@@ -233,10 +237,12 @@ class RetentionService:
         backup_checker: SourceBackupChecker | None = None,
         actor_user_id: int | None = None,
     ) -> RetentionService:
+        retention = effective_settings(session, settings)["source_retention_days"]
         return cls(
             session,
             storage_root=Path(settings.source_storage_dir),
-            retention_days=settings.source_retention_days,
+            retention_days=cast(int, retention["value"]),
+            retention_source=str(retention["source"]),
             backup_checker=backup_checker,
             actor_user_id=actor_user_id,
         )
@@ -351,6 +357,7 @@ class RetentionService:
         return CleanupResult(
             as_of=current_date,
             retention_days=self.retention_days,
+            retention_source=self.retention_source,
             dry_run=dry_run,
             candidate_count=len(candidates),
             deleted_count=deleted_count,
@@ -523,8 +530,8 @@ class RetentionService:
                 return value
         return None
 
-    @staticmethod
     def _summary(
+        self,
         *,
         as_of: date,
         dry_run: bool,
@@ -538,6 +545,8 @@ class RetentionService:
     ) -> dict[str, object]:
         return {
             "as_of": as_of.isoformat(),
+            "retention_days": self.retention_days,
+            "retention_source": self.retention_source,
             "dry_run": dry_run,
             "candidate_count": candidate_count,
             "total_size": total_size,

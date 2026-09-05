@@ -289,9 +289,9 @@ def test_processor_coalesces_clean_publications_by_fund(
         ]
         assert len(runs) == len(jobs) == len(result.analysis_run_ids) == 1
         assert runs[0].input_start_date == date(2026, 8, 25)
-        assert runs[0].input_end_date == date(2026, 8, 26)
+        assert runs[0].input_end_date is None
         assert runs[0].input_version_range == (
-            f"fund:{fund.id};dates:2026-08-25..2026-08-26"
+            f"fund:{fund.id};dates:2026-08-25..latest"
         )
         assert len(publication_audits) == 2
         assert all(

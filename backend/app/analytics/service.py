@@ -15,6 +15,7 @@ from app.analytics.company import CompanyMetric, calculate_company_index
 from app.analytics.concentration import calculate_concentration
 from app.analytics.drawdown import calculate_drawdown
 from app.analytics.nav import calculate_nav_series
+from app.analytics.scope import COMPANY_SCOPE_TRIGGER, lock_company_scope
 from app.db.base import (
     AnalysisRunStatus,
     AuditResult,
@@ -66,24 +67,27 @@ def process_analysis_run(
     run.started_at = datetime.now(UTC)
     session.flush()
 
+    lock_company_scope(session)
     records = _published_records(session)
     trigger = (
         session.get(ValuationVersion, run.trigger_version_id)
         if run.trigger_version_id is not None
         else None
     )
-    if trigger is None:
+    if trigger is None and run.trigger_reason != COMPANY_SCOPE_TRIGGER:
         raise ValueError("analysis_trigger_version_not_found")
-    start_date = run.input_start_date or trigger.valuation_date
+    start_date = run.input_start_date or (
+        trigger.valuation_date if trigger else date.min
+    )
     end_date = run.input_end_date
     grouped_records = _by_fund(records)
-    trigger_records = grouped_records.get(trigger.fund_id, ())
+    trigger_records = grouped_records.get(trigger.fund_id, ()) if trigger else ()
     affected_records = tuple(
         item
         for item in trigger_records
         if _date_in_range(item.version.valuation_date, start_date, end_date)
     )
-    if not affected_records and trigger.status == ValuationStatus.PUBLISHED:
+    if not affected_records and trigger and trigger.status == ValuationStatus.PUBLISHED:
         raise ValueError("analysis_input_not_found")
 
     session.execute(
@@ -96,7 +100,8 @@ def process_analysis_run(
     )
     positions = _group_positions(session, affected_records)
     rules = tuple(session.scalars(select(RiskRule).order_by(RiskRule.id)).all())
-    _lock_fund_for_analysis(session, trigger.fund_id)
+    if trigger is not None:
+        _lock_fund_for_analysis(session, trigger.fund_id)
     existing_events = (
         _open_risk_events(
             session,
@@ -104,7 +109,7 @@ def process_analysis_run(
             start_date=start_date,
             end_date=end_date or affected_records[-1].version.valuation_date,
         )
-        if affected_records
+        if affected_records and trigger is not None
         else {}
     )
 
@@ -136,7 +141,7 @@ def process_analysis_run(
                 }
             )
 
-        if fund_id != trigger.fund_id:
+        if trigger is None or fund_id != trigger.fund_id:
             continue
         drawdown = calculate_drawdown(
             [
@@ -184,7 +189,7 @@ def process_analysis_run(
                         "daily_return": nav_point.daily_return,
                         "drawdown": drawdown_point.drawdown,
                         "current_drawdown": drawdown_point.drawdown,
-                        "max_drawdown": drawdown.max_drawdown,
+                        "max_drawdown": drawdown_point.max_drawdown,
                         "concentration": concentration.hhi,
                         "single_position_weight": concentration.max_single_weight,
                         "top_five_weight": concentration.top_five_weight,

@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -344,3 +345,78 @@ def test_expired_analysis_job_at_attempt_limit_marks_run_failed(
         session.expire_all()
 
         assert session.get(AnalysisRun, run.id).status == AnalysisRunStatus.FAILED
+
+
+def test_max_drawdown_risk_uses_only_history_available_on_each_date(
+    app_and_engine,
+) -> None:
+    app, engine = app_and_engine
+    with Session(engine) as session:
+        fund = Fund(standard_name="回撤日期边界")
+        session.add(fund)
+        session.flush()
+        publisher = PublishingService(session)
+        for day, nav in enumerate(("1", "1.1", "0.7", "1.2"), start=1):
+            version = ValuationVersion(
+                fund_id=fund.id,
+                valuation_date=date(2026, 1, day),
+                version_no=1,
+                status=ValuationStatus.PUBLISHABLE,
+            )
+            session.add(version)
+            session.flush()
+            session.add_all(
+                [
+                    FundDailySnapshot(
+                        valuation_version_id=version.id,
+                        net_asset_value=100,
+                        unit_nav=Decimal(nav),
+                        cumulative_unit_nav=Decimal(nav),
+                    ),
+                    ValidationResult(
+                        valuation_version_id=version.id,
+                        rule_code="test",
+                        level="info",
+                        message="通过",
+                    ),
+                ]
+            )
+            session.flush()
+            publisher.publish_version(
+                version.id, actor_user_id=None, schedule_analysis=False
+            )
+        session.add(
+            RiskRule(
+                rule_code="historical_drawdown",
+                rule_type="max_drawdown",
+                scope="all",
+                threshold=Decimal("-0.2"),
+                severity=RiskSeverity.WARNING,
+                version="1",
+                enabled=True,
+            )
+        )
+        publisher.queue_analysis_run(
+            version.id,
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 4),
+            actor_user_id=None,
+            trigger_reason="test",
+        )
+        session.commit()
+
+        result = process_next_job(session, app.state.settings)
+        assert result[0].status == JobStatus.SUCCEEDED
+        events = session.scalars(
+            select(RiskEvent).order_by(RiskEvent.valuation_date)
+        ).all()
+
+        assert [event.valuation_date for event in events] == [
+            date(2026, 1, 3),
+            date(2026, 1, 4),
+        ]
+        observed = [
+            json.loads(event.evidence_snapshot)["observed_value"] for event in events
+        ]
+        assert Decimal(observed[0]) < Decimal("-0.36")
+        assert observed[0] == observed[1]

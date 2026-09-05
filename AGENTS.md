@@ -8,9 +8,9 @@
 
 ## 当前生产版本
 
-- 部署 commit：`93796c4 fix(api): harden nav-series export default window and reject >5y explicit spans`
-- 部署日期：2026-08-28（服务器 `/opt/fund-dashboard` `git rev-parse HEAD` 已核实为 93796c4）
-- 本地发布标签：`prod-20260828-93796c4`
+- 部署 commit：`332f5b0 fix: harden production data and operations paths`
+- 部署日期：2026-09-06（服务器 `/opt/fund-dashboard` `git rev-parse HEAD` 已核实为 332f5b0）
+- 本地发布标签：`prod-20260906-332f5b0`
 - 复核方式：`git tag --sort=-creatordate` 查最新 prod 标签；服务器 `/opt/fund-dashboard` 内 `git rev-parse HEAD` 应为本次部署 commit。
 
 > 此次部署包括以下 fix（按提交链）：

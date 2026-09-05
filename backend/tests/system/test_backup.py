@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import subprocess
 from datetime import UTC, datetime
@@ -136,3 +137,85 @@ def test_remote_source_backup_is_explicitly_not_configured() -> None:
 
     assert result.status == "not_configured"
     assert "not configured" in result.message
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["dump_failed", "timeout", "missing", "empty", "corrupt", "verify_timeout"],
+)
+def test_failed_or_unverified_backup_never_rotates_existing_recovery_points(
+    session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    old_backup = tmp_path / "database-old.dump"
+    old_backup.write_bytes(b"existing recovery point")
+    os.utime(old_backup, (0, 0))
+    deleted: list[Path] = []
+    monkeypatch.setattr(Path, "unlink", lambda path, **_kw: deleted.append(path))
+
+    def runner(command):
+        if command[0] == "pg_dump":
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(command, 1)
+            if failure == "dump_failed":
+                return subprocess.CompletedProcess(command, 1)
+            if failure != "missing":
+                Path(command[command.index("--file") + 1]).write_bytes(
+                    b"" if failure == "empty" else b"invalid archive"
+                )
+            return subprocess.CompletedProcess(command, 0)
+        if failure == "verify_timeout":
+            raise subprocess.TimeoutExpired(command, 1)
+        return subprocess.CompletedProcess(command, 1)
+
+    result = BackupService(
+        session,
+        DatabaseBackupAdapter(
+            "postgresql+psycopg://backup@db/funds", tmp_path, runner=runner
+        ),
+    ).run(output_name="database-new.dump")
+
+    assert result.status == BackupStatus.FAILED
+    assert deleted == []
+    assert old_backup.exists()
+    audit = session.get(AuditLog, result.audit_log_id)
+    assert audit.result == AuditResult.FAILURE
+    assert audit.summary["cleanup_deleted_count"] == 0
+    assert audit.summary["cleanup_skipped_reason"] == "backup_failed"
+
+
+def test_successful_archive_is_fully_read_before_scoped_rotation(
+    session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_backup = tmp_path / "database-old.dump"
+    unrelated = tmp_path / "keep.txt"
+    for path in (old_backup, unrelated):
+        path.write_bytes(b"old")
+        os.utime(path, (0, 0))
+    commands = []
+    deleted: list[Path] = []
+    monkeypatch.setattr(Path, "unlink", lambda path, **_kw: deleted.append(path))
+
+    def runner(command):
+        commands.append(tuple(command))
+        assert deleted == []
+        if command[0] == "pg_dump":
+            target = Path(command[command.index("--file") + 1])
+            target.write_bytes(b"archive verified by the runner")
+            # The new recovery point stays protected regardless of its timestamp.
+            os.utime(target, (0, 0))
+        return subprocess.CompletedProcess(command, 0)
+
+    result = BackupService(
+        session,
+        DatabaseBackupAdapter(
+            "postgresql+psycopg://backup@db/funds", tmp_path, runner=runner
+        ),
+    ).run(output_name="database-current.dump")
+
+    assert result.status == BackupStatus.SUCCEEDED
+    assert commands[1] == ("pg_restore", "--file", os.devnull, str(result.backup_path))
+    assert deleted == [old_backup]
+    assert unrelated.exists()
+    audit = session.get(AuditLog, result.audit_log_id)
+    assert audit.summary["archive_verified"] is True
+    assert audit.summary["cleanup_deleted_count"] == 1

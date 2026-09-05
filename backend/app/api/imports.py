@@ -3,23 +3,23 @@
 from __future__ import annotations
 
 import mimetypes
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import (
     APIRouter,
     Depends,
-    File,
     HTTPException,
     Query,
     Request,
-    UploadFile,
     status,
 )
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from starlette.datastructures import UploadFile
 
 from app.auth.dependencies import AuthContext, get_db, require_roles
 from app.db.base import AuditResult, ImportBatchStatus, JobStatus, SourceType, UserRole
@@ -32,6 +32,7 @@ from app.db.models import (
     ValidationResult,
     ValuationVersion,
 )
+from app.imports.http_upload import bounded_upload
 from app.imports.service import ImportService
 from app.imports.storage import resolve_in_root
 
@@ -49,6 +50,15 @@ class CreateBatchRequest(BaseModel):
 
 def _service(request: Request, session: Session) -> ImportService:
     return ImportService.from_settings(session, request.app.state.settings)
+
+
+async def _authorized_upload(
+    request: Request, _: ImportOperator
+) -> AsyncIterator[UploadFile]:
+    async with bounded_upload(
+        request, max_file_bytes=request.app.state.settings.max_upload_bytes
+    ) as upload:
+        yield upload
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -115,13 +125,30 @@ def list_batches(
     }
 
 
-@router.post("/{batch_id}/files", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/{batch_id}/files",
+    status_code=status.HTTP_201_CREATED,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {"file": {"type": "string", "format": "binary"}},
+                    }
+                }
+            },
+        }
+    },
+)
 def upload_file(
     batch_id: int,
     request: Request,
     context: ImportOperator,
     session: DatabaseSession,
-    file: UploadFile = File(...),  # noqa: B008
+    file: Annotated[UploadFile, Depends(_authorized_upload)],
 ) -> dict[str, object]:
     service = _service(request, session)
     try:

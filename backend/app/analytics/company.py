@@ -98,7 +98,8 @@ def calculate_company_index(
         eligible = [
             fund_id
             for fund_id in expected_ids
-            if fund_id in previous
+            if previous_total != 0
+            and fund_id in previous
             and fund_id in current
             and previous[fund_id][0] is not None
             and current[fund_id][1] is not None

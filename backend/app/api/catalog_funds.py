@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import Field, model_validator
 from sqlalchemy import select
 
+from app.analytics.scope import lock_company_scope, queue_company_analysis_run
 from app.api.catalog_aliases import AliasInput
 from app.api.catalog_shared import (
     CatalogOperator,
@@ -194,8 +195,13 @@ def update_fund(
 def enable_fund(
     fund_id: int, context: CatalogOperator, session: DatabaseSession
 ) -> dict[str, object]:
+    lock_company_scope(session)
     fund = _fund_or_404(session, fund_id)
-    fund.status = FundStatus.ACTIVE
+    if fund.status != FundStatus.ACTIVE:
+        fund.status = FundStatus.ACTIVE
+        queue_company_analysis_run(
+            session, fund_id=fund.id, actor_user_id=context.user.id
+        )
     _audit(
         session,
         context,
@@ -214,8 +220,13 @@ def disable_fund(
     context: CatalogOperator,
     session: DatabaseSession,
 ) -> dict[str, object]:
+    lock_company_scope(session)
     fund = _fund_or_404(session, fund_id)
-    fund.status = FundStatus.INACTIVE
+    if fund.status != FundStatus.INACTIVE:
+        fund.status = FundStatus.INACTIVE
+        queue_company_analysis_run(
+            session, fund_id=fund.id, actor_user_id=context.user.id
+        )
     _audit(
         session,
         context,

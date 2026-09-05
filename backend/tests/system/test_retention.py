@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+import pytest
 from sqlalchemy import event
 from sqlalchemy.orm import Session
 
@@ -16,9 +18,11 @@ from app.db.models import (
     ImportBatch,
     ImportBatchFile,
     SourceFile,
+    SystemState,
     ValuationVersion,
 )
 from app.system.retention import RetentionService
+from app.system.settings import update_settings
 
 
 def _source(
@@ -134,7 +138,48 @@ def test_dry_run_keeps_object_and_standardized_rows_and_writes_log(
         "deleted_size": 0,
         "skipped_reasons": {},
         "errors": [],
+        "retention_days": 365,
+        "retention_source": "explicit",
     }
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_persisted_retention_applies_to_new_sessions_and_cleanup_modes(
+    session: Session, tmp_path: Path, dry_run: bool
+) -> None:
+    settings = replace(
+        get_settings(), source_storage_dir=str(tmp_path), source_retention_days=365
+    )
+    _source(session, tmp_path, "must-retain.xlsx")
+    update_settings(session, settings, {"source_retention_days": 730})
+    session.commit()
+
+    with Session(session.get_bind()) as fresh_session:
+        service = RetentionService.from_settings(fresh_session, settings)
+        result = service.run(as_of=date(2026, 8, 26), dry_run=dry_run)
+
+        assert service.retention_days == 730
+        assert result.retention_days == 730
+        assert result.retention_source == "database"
+        assert result.candidate_count == 0
+        audit = fresh_session.get(AuditLog, result.audit_log_id)
+        assert audit.summary["retention_days"] == 730
+        assert audit.summary["retention_source"] == "database"
+    assert (tmp_path / "must-retain.xlsx").exists()
+
+
+@pytest.mark.parametrize("persisted", [None, -1, True, "730"])
+def test_retention_falls_back_to_runtime_for_absent_or_invalid_override(
+    session: Session, tmp_path: Path, persisted: object
+) -> None:
+    settings = replace(
+        get_settings(), source_storage_dir=str(tmp_path), source_retention_days=500
+    )
+    if persisted is not None:
+        session.add(SystemState(id=1, settings={"source_retention_days": persisted}))
+        session.flush()
+
+    assert RetentionService.from_settings(session, settings).retention_days == 500
 
 
 def test_cleanup_skips_review_failed_locked_and_unbacked_files(

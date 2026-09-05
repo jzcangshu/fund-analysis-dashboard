@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import secrets
 import sqlite3
 import subprocess
@@ -71,11 +72,13 @@ class DatabaseBackupAdapter:
         backup_root: Path,
         *,
         pg_dump_executable: str = "pg_dump",
+        pg_restore_executable: str = "pg_restore",
         runner: CommandRunner | None = None,
     ) -> None:
         self.database_url = database_url
         self.backup_root = Path(backup_root).resolve()
         self.pg_dump_executable = pg_dump_executable
+        self.pg_restore_executable = pg_restore_executable
         self.runner = runner
         self._url = make_url(database_url)
 
@@ -157,18 +160,7 @@ class DatabaseBackupAdapter:
     def _execute_postgresql(
         self, target: Path, command: tuple[str, ...]
     ) -> BackupExecution:
-        if self.runner is None:
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=30 * 60,
-            )
-        else:
-            completed = self.runner(command)
-        returncode = getattr(completed, "returncode", completed)
-        if returncode != 0:
+        if not self._run_command(command):
             return BackupExecution(
                 status=BackupStatus.FAILED,
                 target_path=target,
@@ -176,12 +168,37 @@ class DatabaseBackupAdapter:
                 size_bytes=target.stat().st_size if target.is_file() else 0,
                 error_code="pg_dump_failed",
             )
+        size = target.stat().st_size if target.is_file() else 0
+        error_code = None
+        if not size or target.is_symlink():
+            error_code = "backup_output_invalid"
+        elif not self._run_command(
+            (self.pg_restore_executable, "--file", os.devnull, str(target))
+        ):
+            # Read the entire archive, including compressed data sections. Listing
+            # its table of contents alone does not detect truncated data blocks.
+            error_code = "backup_archive_invalid"
         return BackupExecution(
-            status=BackupStatus.SUCCEEDED,
+            status=BackupStatus.FAILED if error_code else BackupStatus.SUCCEEDED,
             target_path=target,
             command=command,
-            size_bytes=target.stat().st_size if target.is_file() else 0,
+            size_bytes=size,
+            error_code=error_code,
         )
+
+    def _run_command(self, command: tuple[str, ...]) -> bool:
+        completed = (
+            subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30 * 60,
+            )
+            if self.runner is None
+            else self.runner(command)
+        )
+        return getattr(completed, "returncode", completed) == 0
 
     def _execute_sqlite(
         self, target: Path, command: tuple[str, ...]
@@ -192,11 +209,15 @@ class DatabaseBackupAdapter:
             sqlite3.connect(str(target)) as target_connection,
         ):
             source_connection.backup(target_connection)
+            valid = target_connection.execute("PRAGMA quick_check").fetchall() == [
+                ("ok",)
+            ]
         return BackupExecution(
-            status=BackupStatus.SUCCEEDED,
+            status=BackupStatus.SUCCEEDED if valid else BackupStatus.FAILED,
             target_path=target,
             command=command,
             size_bytes=target.stat().st_size if target.is_file() else 0,
+            error_code=None if valid else "backup_archive_invalid",
         )
 
     def _sqlite_source_path(self) -> Path:
@@ -255,6 +276,7 @@ class BackupService:
         *,
         actor_user_id: int | None = None,
         pg_dump_executable: str = "pg_dump",
+        pg_restore_executable: str = "pg_restore",
         runner: CommandRunner | None = None,
     ) -> BackupService:
         from app.db.models import SystemState
@@ -263,6 +285,7 @@ class BackupService:
             settings.database_url,
             Path(settings.database_backup_dir),
             pg_dump_executable=pg_dump_executable,
+            pg_restore_executable=pg_restore_executable,
             runner=runner,
         )
         retention_days = 30
@@ -278,8 +301,10 @@ class BackupService:
             retention_days=retention_days,
         )
 
-    def cleanup_old_backups(self, *, now: datetime | None = None) -> dict[str, object]:
-        """Delete backup files older than ``retention_days``.
+    def cleanup_old_backups(
+        self, *, protected_path: Path, now: datetime | None = None
+    ) -> dict[str, object]:
+        """Rotate expired files while retaining the newly verified archive.
 
         Only files matching ``database-*.dump`` in the backup root are
         considered.  Errors are captured in the returned dict so callers can
@@ -303,9 +328,11 @@ class BackupService:
         try:
             for path in sorted(backup_root.glob(self.BACKUP_FILE_PATTERN)):
                 try:
-                    if not path.is_file():
+                    if not path.is_file() or path.is_symlink():
                         continue
-                    if path.stat().st_mtime < cutoff:
+                    if path.resolve() == protected_path.resolve():
+                        kept_count += 1
+                    elif path.stat().st_mtime < cutoff:
                         size = path.stat().st_size
                         path.unlink()
                         deleted_count += 1
@@ -332,7 +359,17 @@ class BackupService:
         current_time = now or datetime.now(UTC)
         name = output_name or self._default_output_name(current_time)
         execution = self.adapter.execute(name)
-        cleanup = self.cleanup_old_backups(now=current_time)
+        cleanup: dict[str, object] = {
+            "deleted_count": 0,
+            "deleted_bytes": 0,
+            "kept_count": 0,
+            "errors": [],
+        }
+        verified = execution.status == BackupStatus.SUCCEEDED
+        if verified and execution.target_path is not None:
+            cleanup = self.cleanup_old_backups(
+                protected_path=execution.target_path, now=current_time
+            )
         summary = {
             "status": execution.status.value,
             "backup_name": execution.target_path.name
@@ -344,6 +381,8 @@ class BackupService:
             "completed_at": current_time.isoformat(),
             "remote_source_backup": "not_configured",
             "retention_days": self.retention_days,
+            "archive_verified": verified,
+            "cleanup_skipped_reason": None if verified else "backup_failed",
             "cleanup_deleted_count": cleanup["deleted_count"],
             "cleanup_deleted_bytes": cleanup["deleted_bytes"],
             "cleanup_kept_count": cleanup["kept_count"],

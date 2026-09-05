@@ -33,6 +33,8 @@ class ParsedSubject:
     is_leaf: bool
     hierarchy_path: tuple[str, ...]
     source_row: int
+    unit_cost: Decimal | None = None
+    market_price: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)

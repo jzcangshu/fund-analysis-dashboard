@@ -47,8 +47,8 @@ DEFAULT_VALUES: dict[str, object] = {
 MAIL_USERNAME_SETTING = "mail_imap_username"
 
 RUNTIME_NOTE = (
-    "The mail sync switch is read before every scheduled run. Other database-backed "
-    "values are persisted but are not hot-applied by current worker processes."
+    "Mail scheduling settings are read before each scheduled run. Source and backup "
+    "retention settings are read when each maintenance operation starts."
 )
 
 
